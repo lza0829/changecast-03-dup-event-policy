@@ -6,8 +6,14 @@ from typing import Any
 
 from app.config import FIXTURES_DIR
 from app.db import connect
-from app.engines.project import apply_events
+from app.engines.digest import payload_digest
+from app.engines.project import (
+    OUTCOME_QUARANTINE,
+    RES_BATCH_REJECTED,
+    apply_events,
+)
 from app.repositories import batches as batch_repo
+from app.repositories import conflicts as conflict_repo
 from app.repositories import projections as proj_repo
 from app.repositories import streams as stream_repo
 
@@ -34,6 +40,17 @@ def dashboard_stats() -> dict[str, Any]:
                 "SELECT COUNT(*) c FROM project_streams WHERE enabled=1"
             ).fetchone()["c"],
             "batch_count": conn.execute("SELECT COUNT(*) c FROM project_batches").fetchone()["c"],
+            "rejected_batches": batch_repo.count_rejected_batches(conn),
+            "payload_conflicts": conn.execute(
+                "SELECT COALESCE(SUM(payload_conflicts),0) c FROM project_batches"
+            ).fetchone()["c"],
+            "quarantined_events": conn.execute(
+                "SELECT COUNT(*) c FROM conflict_events WHERE outcome=?",
+                (OUTCOME_QUARANTINE,),
+            ).fetchone()["c"],
+            "skipped_duplicates": conn.execute(
+                "SELECT COALESCE(SUM(skipped_duplicate),0) c FROM project_batches"
+            ).fetchone()["c"],
             "projection_alive": conn.execute(
                 "SELECT COUNT(*) c FROM projection_rows WHERE deleted=0"
             ).fetchone()["c"],
@@ -95,6 +112,22 @@ def list_events(batch_id: int | None = None, stream_id: int | None = None) -> li
         conn.close()
 
 
+def list_conflicts(stream_id: int | None = None, batch_id: int | None = None) -> list[dict[str, Any]]:
+    conn = connect()
+    try:
+        rows = conflict_repo.list_conflict_events(
+            conn, stream_id=stream_id, batch_id=batch_id
+        )
+        streams = {s["id"]: s for s in stream_repo.list_streams(conn)}
+        for r in rows:
+            s = streams.get(r["stream_id"])
+            r["stream_code"] = s["code"] if s else None
+            r["stream_title"] = s["title"] if s else None
+        return rows
+    finally:
+        conn.close()
+
+
 def list_ooo_buffer(stream_id: int | None = None) -> list[dict[str, Any]]:
     conn = connect()
     try:
@@ -112,8 +145,37 @@ def list_settings() -> dict[str, str]:
         conn.close()
 
 
+def update_stream_policy(
+    stream_id: int, duplicate_policy: str, conflict_outcome: str
+) -> dict[str, Any]:
+    conn = connect()
+    try:
+        stream = stream_repo.get_stream(conn, stream_id)
+        if not stream:
+            raise ValueError("stream not found")
+        stream_repo.update_duplicate_policy(
+            conn,
+            stream_id=stream_id,
+            duplicate_policy=duplicate_policy,
+            conflict_outcome=conflict_outcome,
+        )
+        conn.commit()
+        updated = stream_repo.get_stream(conn, stream_id)
+        assert updated is not None
+        return updated
+    finally:
+        conn.close()
+
+
 def run_project(stream_id: int, note: str | None = None) -> dict[str, Any]:
-    """Load CDC fixture, apply by seq, replace projection for the stream."""
+    """Load CDC fixture and project it under the stream's duplicate policy.
+
+    The policy is read and frozen before any event is processed, so a config
+    change made while the batch is in flight cannot alter this run's result.
+    A rejected run is committed only as ledger rows (batch + applied log +
+    conflict trail); the projection is left byte-identical to its pre-run
+    snapshot. Everything happens in one transaction — no half success.
+    """
     conn = connect()
     try:
         stream = stream_repo.get_stream(conn, stream_id)
@@ -122,40 +184,102 @@ def run_project(stream_id: int, note: str | None = None) -> dict[str, Any]:
         if not stream["enabled"]:
             raise ValueError("stream disabled")
 
+        # --- frozen policy snapshot for this run ---------------------------
+        duplicate_policy = stream["duplicate_policy"]
+        conflict_outcome = stream["conflict_outcome"]
+
         events = _load_fixture(stream["fixture"])
-        # Base 0-1: each run rebuilds projection from the full fixture by seq.
-        # Incremental watermark / cross-run idempotency left for later topics.
-        result = apply_events(events, known_event_ids=set())
+        initial_projection = proj_repo.load_initial_projection(conn, stream_id)
+        known_digests = proj_repo.list_known_event_digests(conn, stream_id)
+
+        # Upgraded databases may carry pre-feature applied_events without
+        # digests. Reconstruct their digests from the fixture's first
+        # occurrence (the body that was actually applied), so cross-run
+        # duplicates are still detected instead of silently re-applying.
+        legacy_ids = proj_repo.list_legacy_applied_event_ids(conn, stream_id)
+        if legacy_ids:
+            fixture_first: dict[str, str] = {}
+            for ev in events:
+                eid = str(ev["event_id"])
+                fixture_first.setdefault(eid, payload_digest(ev.get("payload")))
+            for eid in legacy_ids:
+                digest = fixture_first.get(eid)
+                if digest is not None:
+                    known_digests.setdefault(eid, digest)
+
+        result = apply_events(
+            events,
+            known_event_ids=known_digests,
+            initial_projection=initial_projection,
+            duplicate_policy=duplicate_policy,
+            conflict_outcome=conflict_outcome,
+        )
+
         now = _now()
         seq = conn.execute("SELECT COUNT(*) c FROM project_batches").fetchone()["c"] + 1
         batch_no = f"PB-{now[:10].replace('-', '')}-{seq:04d}"
+        rejected = result["status"] == "rejected"
+
         batch_id = batch_repo.insert_batch(
             conn,
             batch_no=batch_no,
             stream_id=stream_id,
-            status="completed",
+            status=result["status"],
             counts=result["counts"],
             note=note,
             created_at=now,
+            duplicate_policy=duplicate_policy,
+            conflict_outcome=conflict_outcome,
+            reject_reason=result["reject_reason"],
         )
-        proj_repo.replace_stream_projection(
-            conn, stream_id=stream_id, rows=result["projection"], updated_at=now
-        )
+
+        # Ledger trail is written for every run, including rejected ones,
+        # so 跳过数/冲突数/拒绝次数 can be reconciled against projection state.
         for ev in result["applied_log"]:
             batch_repo.insert_applied_event(
                 conn, batch_id=batch_id, stream_id=stream_id, event=ev, created_at=now
             )
-        stream_repo.set_watermark(conn, stream_id, result["counts"]["max_seq"])
-        conn.commit()
+        for ev in result["conflict_log"]:
+            outcome = RES_BATCH_REJECTED if rejected else OUTCOME_QUARANTINE
+            conflict_repo.insert_conflict_event(
+                conn,
+                stream_id=stream_id,
+                batch_id=batch_id,
+                event=ev,
+                outcome=outcome,
+                created_at=now,
+            )
+
+        if rejected:
+            # Whole-batch failure: keep the pre-run projection untouched.
+            # No watermark advance — nothing from this run was applied.
+            conn.commit()
+        else:
+            proj_repo.replace_stream_projection(
+                conn, stream_id=stream_id, rows=result["projection"], updated_at=now
+            )
+            stream_repo.set_watermark(conn, stream_id, result["counts"]["max_seq"])
+            conn.commit()
 
         batch = batch_repo.get_batch(conn, batch_id)
         assert batch is not None
         batch["stream_code"] = stream["code"]
         batch["stream_title"] = stream["title"]
         batch["apply_order"] = "by_seq"
+        batch["rejected_event_id"] = result["rejected_event_id"]
         batch["counts"] = result["counts"]
-        batch["projection_preview"] = proj_repo.list_projections(conn, stream_id=stream_id)[:20]
+        if rejected:
+            # Pre-run snapshot proves the projection did not move.
+            batch["projection_preview"] = proj_repo.list_projections(conn, stream_id=stream_id)[:20]
+        else:
+            batch["projection_preview"] = proj_repo.list_projections(conn, stream_id=stream_id)[:20]
         batch["event_preview"] = batch_repo.list_applied_events(conn, batch_id=batch_id, limit=20)
+        batch["conflict_preview"] = conflict_repo.list_conflict_events(
+            conn, batch_id=batch_id, limit=20
+        )
         return batch
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()

@@ -14,13 +14,18 @@ def insert_batch(
     counts: dict[str, int],
     note: str | None,
     created_at: str,
+    duplicate_policy: str | None = None,
+    conflict_outcome: str | None = None,
+    reject_reason: str | None = None,
 ) -> int:
     cur = conn.execute(
         """
         INSERT INTO project_batches(
             batch_no, stream_id, status, source_events, applied_upsert, applied_delete,
-            skipped_duplicate, projected_alive, projected_deleted, max_seq, note, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
+            skipped_duplicate, projected_alive, projected_deleted, max_seq, note, created_at,
+            payload_conflicts, batch_rejections, quarantined_events,
+            duplicate_policy, conflict_outcome, reject_reason
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             batch_no,
@@ -35,6 +40,12 @@ def insert_batch(
             counts["max_seq"],
             note,
             created_at,
+            counts.get("payload_conflicts", 0),
+            counts.get("batch_rejections", 0),
+            counts.get("quarantined_events", 0),
+            duplicate_policy,
+            conflict_outcome,
+            reject_reason,
         ),
     )
     return int(cur.lastrowid)
@@ -53,6 +64,19 @@ def get_batch(conn: sqlite3.Connection, batch_id: int) -> dict[str, Any] | None:
     return dict(r) if r else None
 
 
+def count_rejected_batches(conn: sqlite3.Connection, stream_id: int | None = None) -> int:
+    if stream_id is None:
+        r = conn.execute(
+            "SELECT COUNT(*) c FROM project_batches WHERE status='rejected'"
+        ).fetchone()
+    else:
+        r = conn.execute(
+            "SELECT COUNT(*) c FROM project_batches WHERE status='rejected' AND stream_id=?",
+            (stream_id,),
+        ).fetchone()
+    return int(r["c"])
+
+
 def insert_applied_event(
     conn: sqlite3.Connection,
     *,
@@ -64,8 +88,9 @@ def insert_applied_event(
     conn.execute(
         """
         INSERT INTO applied_events(
-            batch_id, stream_id, event_id, entity_key, op, seq, event_time, result, created_at
-        ) VALUES (?,?,?,?,?,?,?,?,?)
+            batch_id, stream_id, event_id, entity_key, op, seq, event_time, result,
+            created_at, payload_digest, prior_digest
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             batch_id,
@@ -77,6 +102,8 @@ def insert_applied_event(
             event["event_time"],
             event["result"],
             created_at,
+            event.get("payload_digest"),
+            event.get("prior_digest"),
         ),
     )
 

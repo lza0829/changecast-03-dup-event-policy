@@ -8,6 +8,21 @@ const rows = ref([])
 const batchId = ref(null)
 const err = ref('')
 
+const RESULT_TAG = {
+  applied_upsert: '',
+  applied_delete: '',
+  skipped_duplicate: 'ok',
+  conflict_quarantined: 'warn',
+  batch_rejected: 'danger',
+}
+const RESULT_LABEL = {
+  applied_upsert: '写入',
+  applied_delete: '删除',
+  skipped_duplicate: '跳过重复',
+  conflict_quarantined: '冲突隔离',
+  batch_rejected: '整批拒绝',
+}
+
 async function refresh() {
   const q = new URLSearchParams()
   if (batchId.value) q.set('batch_id', String(batchId.value))
@@ -30,7 +45,10 @@ watch(batchId, async () => {
 <template>
   <div class="page">
     <h1>事件留痕</h1>
-    <p class="muted">本批（或全部）已处理事件：结果为写入 / 删除 / 跳过重复。</p>
+    <p class="muted">
+      本批（或全部）已处理事件：写入 / 删除 / 跳过重复（摘要相同，未二次改投影）/ 冲突隔离 / 整批拒绝。
+      每条都带载荷摘要，重复事件另附既往摘要供互证。
+    </p>
     <p v-if="err" class="tag danger">{{ err }}</p>
     <div class="panel" style="display:flex;gap:0.75rem;align-items:flex-end">
       <label>
@@ -43,7 +61,8 @@ watch(batchId, async () => {
       <table>
         <thead>
           <tr>
-            <th>批次</th><th>event_id</th><th>实体键</th><th>op</th><th>seq</th><th>事件时间</th><th>结果</th>
+            <th>批次</th><th>event_id</th><th>实体键</th><th>op</th><th>seq</th>
+            <th>事件时间</th><th>结果</th><th>载荷摘要</th><th>既往摘要</th>
           </tr>
         </thead>
         <tbody>
@@ -54,11 +73,17 @@ watch(batchId, async () => {
             <td class="mono">{{ e.op }}</td>
             <td class="mono">{{ e.seq }}</td>
             <td class="mono">{{ e.event_time }}</td>
-            <td><span class="tag">{{ e.result }}</span></td>
+            <td><span class="tag" :class="RESULT_TAG[e.result]">{{ RESULT_LABEL[e.result] || e.result }}</span></td>
+            <td class="mono digest">{{ e.payload_digest ? e.payload_digest.slice(0, 12) : '—' }}</td>
+            <td class="mono digest">{{ e.prior_digest ? e.prior_digest.slice(0, 12) : '—' }}</td>
           </tr>
-          <tr v-if="!rows.length"><td colspan="7" class="muted">暂无留痕。</td></tr>
+          <tr v-if="!rows.length"><td colspan="9" class="muted">暂无留痕。</td></tr>
         </tbody>
       </table>
     </div>
   </div>
 </template>
+
+<style scoped>
+.digest { color: var(--accent-deep); }
+</style>

@@ -13,6 +13,8 @@ STREAM_SEEDS = [
         "payload_fields": ["display_name", "tier", "region"],
         "fixture": "member_profile.json",
         "enabled": 1,
+        "duplicate_policy": "idempotent",
+        "conflict_outcome": "rollback_batch",
     },
     {
         "code": "store_archive",
@@ -22,6 +24,8 @@ STREAM_SEEDS = [
         "payload_fields": ["name", "status", "city"],
         "fixture": "store_archive.json",
         "enabled": 1,
+        "duplicate_policy": "idempotent",
+        "conflict_outcome": "rollback_batch",
     },
     {
         "code": "channel_attr",
@@ -31,12 +35,33 @@ STREAM_SEEDS = [
         "payload_fields": ["label", "active"],
         "fixture": "channel_attr.json",
         "enabled": 1,
+        "duplicate_policy": "idempotent",
+        "conflict_outcome": "rollback_batch",
+    },
+    {
+        "code": "dup_demo",
+        "title": "重复事件演示流",
+        "domain": "demo",
+        "entity_key_name": "cust_id",
+        "payload_fields": ["level", "owner", "note"],
+        "fixture": "dup_demo.json",
+        "enabled": 1,
+        # 策略甲：幂等 + 冲突隔离。整批失败 / 策略乙可在投影流页切换后演示。
+        "duplicate_policy": "idempotent",
+        "conflict_outcome": "quarantine",
     },
 ]
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _ensure_column(conn, table: str, column: str, ddl: str) -> None:
+    """Idempotent ALTER TABLE for SQLite (no IF NOT EXISTS on ADD COLUMN)."""
+    cols = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
 
 
 def init_db() -> None:
@@ -117,8 +142,49 @@ def init_db() -> None:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS conflict_events(
+                id INTEGER PRIMARY KEY,
+                stream_id INTEGER NOT NULL,
+                batch_id INTEGER NOT NULL,
+                event_id TEXT NOT NULL,
+                entity_key TEXT NOT NULL,
+                op TEXT NOT NULL,
+                seq INTEGER NOT NULL,
+                event_time TEXT NOT NULL,
+                payload_json TEXT,
+                payload_digest TEXT NOT NULL,
+                prior_digest TEXT NOT NULL,
+                conflict_kind TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(stream_id) REFERENCES project_streams(id),
+                FOREIGN KEY(batch_id) REFERENCES project_batches(id)
+            );
             """
         )
+
+        # --- migrations for databases created before this feature ---------
+        _ensure_column(conn, "project_streams", "duplicate_policy",
+                       "duplicate_policy TEXT NOT NULL DEFAULT 'idempotent'")
+        _ensure_column(conn, "project_streams", "conflict_outcome",
+                       "conflict_outcome TEXT NOT NULL DEFAULT 'rollback_batch'")
+        _ensure_column(conn, "project_batches", "payload_conflicts",
+                       "payload_conflicts INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "project_batches", "batch_rejections",
+                       "batch_rejections INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "project_batches", "quarantined_events",
+                       "quarantined_events INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(conn, "project_batches", "duplicate_policy",
+                       "duplicate_policy TEXT")
+        _ensure_column(conn, "project_batches", "conflict_outcome",
+                       "conflict_outcome TEXT")
+        _ensure_column(conn, "project_batches", "reject_reason",
+                       "reject_reason TEXT")
+        _ensure_column(conn, "applied_events", "payload_digest",
+                       "payload_digest TEXT")
+        _ensure_column(conn, "applied_events", "prior_digest",
+                       "prior_digest TEXT")
+
         if conn.execute("SELECT COUNT(*) c FROM project_streams").fetchone()["c"] == 0:
             now = _now()
             for s in STREAM_SEEDS:
@@ -126,8 +192,9 @@ def init_db() -> None:
                     """
                     INSERT INTO project_streams(
                         code, title, domain, entity_key_name, payload_fields_json,
-                        fixture, enabled, watermark_seq, created_at
-                    ) VALUES (?,?,?,?,?,?,?,?,?)
+                        fixture, enabled, watermark_seq, duplicate_policy,
+                        conflict_outcome, created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         s["code"],
@@ -138,9 +205,42 @@ def init_db() -> None:
                         s["fixture"],
                         s["enabled"],
                         0,
+                        s["duplicate_policy"],
+                        s["conflict_outcome"],
                         now,
                     ),
                 )
+        else:
+            # Backfill policy columns on pre-feature rows, then make sure the
+            # demo stream exists when reseeding against an older database.
+            conn.execute(
+                "UPDATE project_streams SET duplicate_policy='idempotent' "
+                "WHERE duplicate_policy IS NULL OR duplicate_policy=''"
+            )
+            conn.execute(
+                "UPDATE project_streams SET conflict_outcome='rollback_batch' "
+                "WHERE conflict_outcome IS NULL OR conflict_outcome=''"
+            )
+            existing = {r["code"] for r in conn.execute("SELECT code FROM project_streams")}
+            now = _now()
+            for s in STREAM_SEEDS:
+                if s["code"] in existing:
+                    continue
+                conn.execute(
+                    """
+                    INSERT INTO project_streams(
+                        code, title, domain, entity_key_name, payload_fields_json,
+                        fixture, enabled, watermark_seq, duplicate_policy,
+                        conflict_outcome, created_at
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (
+                        s["code"], s["title"], s["domain"], s["entity_key_name"],
+                        json.dumps(s["payload_fields"], ensure_ascii=False), s["fixture"],
+                        s["enabled"], 0, s["duplicate_policy"], s["conflict_outcome"], now,
+                    ),
+                )
+
         if conn.execute("SELECT COUNT(*) c FROM settings").fetchone()["c"] == 0:
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES (?, ?)",
@@ -148,7 +248,7 @@ def init_db() -> None:
             )
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES (?, ?)",
-                ("duplicate_policy", "skip"),
+                ("duplicate_policy", "idempotent"),
             )
             conn.execute(
                 "INSERT INTO settings(key, value) VALUES (?, ?)",

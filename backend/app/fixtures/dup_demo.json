@@ -1,0 +1,74 @@
+[
+  {
+    "event_id": "dd-001",
+    "entity_key": "C01",
+    "op": "upsert",
+    "seq": 1,
+    "event_time": "2026-04-01T08:00:00Z",
+    "payload": {"level": "A", "owner": "林晓", "note": "建档"}
+  },
+  {
+    "event_id": "dd-002",
+    "entity_key": "C02",
+    "op": "upsert",
+    "seq": 2,
+    "event_time": "2026-04-01T08:05:00Z",
+    "payload": {"level": "B", "owner": "周可", "note": "建档"}
+  },
+  {
+    "event_id": "dd-003",
+    "entity_key": "C01",
+    "op": "upsert",
+    "seq": 3,
+    "event_time": "2026-04-01T08:10:00Z",
+    "payload": {"level": "A", "owner": "林晓", "note": "升级申请"}
+  },
+  {
+    "event_id": "dd-002",
+    "entity_key": "C02",
+    "op": "upsert",
+    "seq": 4,
+    "event_time": "2026-04-01T08:15:00Z",
+    "payload": {"level": "B", "owner": "周可", "note": "建档"}
+  },
+  {
+    "event_id": "dd-004",
+    "entity_key": "C03",
+    "op": "upsert",
+    "seq": 5,
+    "event_time": "2026-04-01T08:20:00Z",
+    "payload": {"level": "C", "owner": "何楠", "note": "建档"}
+  },
+  {
+    "event_id": "dd-003",
+    "entity_key": "C01",
+    "op": "upsert",
+    "seq": 6,
+    "event_time": "2026-04-01T08:25:00Z",
+    "payload": {"level": "A2", "owner": "林晓", "note": "升级申请被篡改"}
+  },
+  {
+    "event_id": "dd-005",
+    "entity_key": "C02",
+    "op": "delete",
+    "seq": 7,
+    "event_time": "2026-04-01T08:30:00Z",
+    "payload": null
+  },
+  {
+    "event_id": "dd-006",
+    "entity_key": "C04",
+    "op": "upsert",
+    "seq": 8,
+    "event_time": "2026-04-01T08:35:00Z",
+    "payload": {"level": "B", "owner": "高岩", "note": "建档"}
+  },
+  {
+    "event_id": "dd-001",
+    "entity_key": "C01",
+    "op": "upsert",
+    "seq": 9,
+    "event_time": "2026-04-01T08:40:00Z",
+    "payload": {"level": "A", "owner": "林晓", "note": "建档"}
+  }
+]
